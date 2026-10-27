@@ -1,0 +1,1925 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AegisGrid - AI-powered multi-agent emergency response platform.
+  Serverless, free-tier-first: Lambda, DynamoDB (provisioned within Always Free), SNS, SQS,
+  Step Functions, Cognito, CloudWatch, X-Ray, SSM Parameter Store, EventBridge Scheduler and
+  CloudFront are Always Free at this scale; API Gateway, EventBridge events, S3, Rekognition,
+  Transcribe, Comprehend, Translate and Bedrock (Amazon Nova) are pay-per-use, costing
+  fractions of a cent per incident and covered by new-account credits. No fixed monthly charges.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedPattern: "[a-z0-9-]+"
+  BedrockModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    Description: >
+      Bedrock model. amazon.nova-* works on a Free-plan account (billed directly by AWS, covered by credits).
+      anthropic.claude-* (e.g. anthropic.claude-opus-5-5) needs a Paid-plan account (sold via AWS Marketplace).
+  BedrockRegion:
+    Type: String
+    Default: ""
+    Description: Region for Bedrock calls. Empty = the stack's region.
+  AgentBriefings:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Agents ask Claude for a short responder briefing with each dispatch.
+  SesSenderEmail:
+    Type: String
+    Default: ""
+    Description: Verified SES identity used as From address. Empty disables email.
+  ControlRoomEmail:
+    Type: String
+    Default: ""
+    Description: Optional email subscribed to CONTROL_ROOM alerts on the dispatch topic.
+  CitizenSms:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable SMS (citizen updates and station phone verification). Costs money; needs SNS SMS production access.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for CloudWatch alarms and the AWS Budgets spending alert.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 1
+    Description: Email AlarmEmail when actual or forecast monthly spend passes this many USD.
+  CorsOrigin:
+    Type: String
+    Default: "*"
+  AdminEmail:
+    Type: String
+    Default: ""
+    Description: The platform owner's email. Creates the single admin account (temporary password sent by email).
+  GoogleClientId:
+    Type: String
+    Default: ""
+    Description: OAuth 2.0 Web client ID from Google Cloud Console. Empty disables "Continue with Google".
+  GoogleClientSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: OAuth 2.0 client secret matching GoogleClientId.
+
+Conditions:
+  HasBedrockRegion: !Not [!Equals [!Ref BedrockRegion, ""]]
+  HasControlRoomEmail: !Not [!Equals [!Ref ControlRoomEmail, ""]]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+  HasGoogle: !Not [!Equals [!Ref GoogleClientId, ""]]
+  HasAdminEmail: !Not [!Equals [!Ref AdminEmail, ""]]
+
+Globals:
+  Function:
+    CodeUri: ./
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 20
+    Tracing: Active
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        NODE_OPTIONS: --enable-source-maps
+        INCIDENTS_TABLE: !Ref IncidentsTable
+        STATIONS_TABLE: !Ref StationsTable
+        OFFERS_TABLE: !Ref OffersTable
+        CITIZENS_TABLE: !Ref CitizensTable
+        USER_POOL_ID: !Ref UserPool
+        SMS_ENABLED: !Ref CitizenSms
+        TIMELINE_TABLE: !Ref TimelineTable
+        MEDIA_BUCKET: !Ref MediaBucket
+        ANALYTICS_BUCKET: !Ref AnalyticsBucket
+        EVENT_BUS_NAME: !Ref EventBus
+        DISPATCH_TOPIC_ARN: !Ref DispatchTopic
+        DIRECTORY_PARAMETER: !Ref DepartmentDirectoryParameter
+        SES_SENDER: !Ref SesSenderEmail
+        CITIZEN_SMS: !Ref CitizenSms
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        BEDROCK_REGION: !If [HasBedrockRegion, !Ref BedrockRegion, !Ref AWS::Region]
+        AGENT_BRIEFINGS: !Ref AgentBriefings
+        CORS_ORIGIN: !Ref CorsOrigin
+
+Resources:
+  # ---------------------------------------------------------------- Security
+  # No customer-managed KMS key (that would be $1/month). Data is still encrypted at rest:
+  # S3 with SSE-S3, DynamoDB with AWS-owned keys, the dispatch SNS topic with the AWS-managed
+  # aws/sns KMS key, and the department directory can be a SecureString (aws/ssm KMS key).
+  DepartmentDirectoryParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /aegisgrid/${Stage}/department-directory
+      Description: Responder contact directory (emails per department) used by the notifier.
+      Type: String
+      Tier: Standard
+      Value: '{"CONTROL_ROOM":{"emails":[]},"AMBULANCE":{"emails":[]},"HOSPITAL":{"emails":[]},"POLICE":{"emails":[]},"FIRE":{"emails":[]},"TRAFFIC":{"emails":[]}}'
+
+  # One user pool for all three account types. Self-registered accounts are citizens;
+  # help-service and admin accounts are placed in groups by an administrator.
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain # accounts survive a stack delete or a replacing update
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub aegisgrid-${Stage}-users
+      LambdaConfig:
+        PostAuthentication: !GetAtt AuthActivityFunction.Arn
+        PostConfirmation: !GetAtt AuthActivityFunction.Arn
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: false }
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: verified_email, Priority: 1 }]
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+        EmailSubject: Your AegisGrid verification code
+        EmailMessage: "Your AegisGrid verification code is {####}"
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        # At least 8 characters with an uppercase letter, a number and a special symbol.
+        PasswordPolicy: { MinimumLength: 8, RequireUppercase: true, RequireNumbers: true, RequireSymbols: true, RequireLowercase: false, TemporaryPasswordValidityDays: 7 }
+      Schema:
+        - { Name: name, AttributeDataType: String, Mutable: true, Required: false }
+        - { Name: phone_number, AttributeDataType: String, Mutable: true, Required: false }
+        # "true" = the citizen allows live GPS location when they don't type a location
+        - { Name: live_location, AttributeDataType: String, Mutable: true, StringAttributeConstraints: { MinLength: "4", MaxLength: "5" } }
+        # "citizen" or "service", chosen at sign-up and fixed. A service account only becomes active
+        # after the admin approves its verified station (membership of ServiceProviders).
+        - { Name: account_type, AttributeDataType: String, Mutable: false, StringAttributeConstraints: { MinLength: "6", MaxLength: "8" } }
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub aegisgrid-${Stage}-${AWS::AccountId}
+
+  GoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Condition: HasGoogle
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: Google
+      ProviderType: Google
+      ProviderDetails:
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: openid email profile
+      AttributeMapping:
+        email: email
+        email_verified: email_verified
+        name: name
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: aegisgrid-web
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 8
+      IdTokenValidity: 8
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { AccessToken: hours, IdToken: hours, RefreshToken: days }
+      # Hosted sign-in, used for "Continue with Google" (authorization code + PKCE)
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile, aws.cognito.signin.user.admin]
+      CallbackURLs:
+        - http://localhost:5173/auth/callback
+        - !Sub "https://${FrontendDistribution.DomainName}/auth/callback"
+      LogoutURLs:
+        - http://localhost:5173/login
+        - !Sub "https://${FrontendDistribution.DomainName}/login"
+      # !Ref on the provider (only when enabled) also orders creation after it
+      SupportedIdentityProviders: !If [HasGoogle, [COGNITO, !Ref GoogleIdentityProvider], [COGNITO]]
+
+  AdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: Admins, Precedence: 0, Description: Platform owner. Never self-assigned. }
+  ServiceProvidersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { UserPoolId: !Ref UserPool, GroupName: ServiceProviders, Precedence: 10, Description: Help-service stations approved by the admin }
+
+  # The one admin account (the platform owner), created at deployment.
+  AdminUser:
+    Type: AWS::Cognito::UserPoolUser
+    Condition: HasAdminEmail
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref AdminEmail
+      DesiredDeliveryMediums: [EMAIL]
+      UserAttributes:
+        - { Name: email, Value: !Ref AdminEmail }
+        - { Name: email_verified, Value: "true" }
+        - { Name: name, Value: AegisGrid Admin }
+  AdminUserGroup:
+    Type: AWS::Cognito::UserPoolUserToGroupAttachment
+    Condition: HasAdminEmail
+    Properties: { UserPoolId: !Ref UserPool, GroupName: !Ref AdminsGroup, Username: !Ref AdminUser }
+
+  # ---------------------------------------------------------------- Storage
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub aegisgrid-${Stage}-media-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT]
+            AllowedOrigins: [!Ref CorsOrigin]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawMedia
+            Status: Enabled
+            Prefix: incidents/
+            ExpirationInDays: 365
+          - Id: ExpireTranscripts
+            Status: Enabled
+            Prefix: transcripts/
+            ExpirationInDays: 90
+
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt MediaBucket.Arn, !Sub "${MediaBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+
+  AnalyticsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub aegisgrid-${Stage}-analytics-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAthenaResults
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: 30
+
+  AnalyticsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AnalyticsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt AnalyticsBucket.Arn, !Sub "${AnalyticsBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+
+  # Provisioned capacity across the 5 tables and 5 indexes adds up to 25 RCU / 25 WCU,
+  # exactly the DynamoDB Always Free allowance. Encrypted at rest with AWS-owned keys (free).
+  # Every table is retained if the stack is deleted or a change would replace it, so stored
+  # history is never lost by a redeploy. TimelineTable also holds each account's activity log.
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub aegisgrid-${Stage}-incidents
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }
+      AttributeDefinitions:
+        - { AttributeName: incidentId, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+        - { AttributeName: reporterId, AttributeType: S }
+      KeySchema: [{ AttributeName: incidentId, KeyType: HASH }]
+      GlobalSecondaryIndexes:
+        - IndexName: ByStatus
+          KeySchema: [{ AttributeName: status, KeyType: HASH }, { AttributeName: createdAt, KeyType: RANGE }]
+          Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }
+        - IndexName: ByReporter
+          KeySchema: [{ AttributeName: reporterId, KeyType: HASH }, { AttributeName: createdAt, KeyType: RANGE }]
+          Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }
+      StreamSpecification: { StreamViewType: NEW_IMAGE }
+
+  StationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub aegisgrid-${Stage}-stations
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }
+      AttributeDefinitions:
+        - { AttributeName: stationId, AttributeType: S }
+        - { AttributeName: serviceType, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+      KeySchema: [{ AttributeName: stationId, KeyType: HASH }]
+      GlobalSecondaryIndexes:
+        - IndexName: ByTypeStatus
+          KeySchema: [{ AttributeName: serviceType, KeyType: HASH }, { AttributeName: status, KeyType: RANGE }]
+          Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: { ReadCapacityUnits: 2, WriteCapacityUnits: 2 }
+
+  OffersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub aegisgrid-${Stage}-offers
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 3, WriteCapacityUnits: 3 }
+      AttributeDefinitions:
+        - { AttributeName: offerId, AttributeType: S }
+        - { AttributeName: stationId, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: expiresAt, AttributeType: S }
+      KeySchema: [{ AttributeName: offerId, KeyType: HASH }]
+      GlobalSecondaryIndexes:
+        - IndexName: ByStation
+          KeySchema: [{ AttributeName: stationId, KeyType: HASH }, { AttributeName: createdAt, KeyType: RANGE }]
+          Projection: { ProjectionType: ALL }
+          ProvisionedThroughput: { ReadCapacityUnits: 2, WriteCapacityUnits: 2 }
+        - IndexName: ByStatusExpiry
+          KeySchema: [{ AttributeName: status, KeyType: HASH }, { AttributeName: expiresAt, KeyType: RANGE }]
+          Projection: { ProjectionType: KEYS_ONLY }
+          ProvisionedThroughput: { ReadCapacityUnits: 2, WriteCapacityUnits: 2 }
+
+  # Citizen trust score, standing, verified phone and recent request times (misuse protection).
+  CitizensTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub aegisgrid-${Stage}-citizens
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 2, WriteCapacityUnits: 2 }
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+      KeySchema: [{ AttributeName: userId, KeyType: HASH }]
+
+  TimelineTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub aegisgrid-${Stage}-timeline
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: { ReadCapacityUnits: 2, WriteCapacityUnits: 2 }
+      AttributeDefinitions:
+        - { AttributeName: incidentId, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema: [{ AttributeName: incidentId, KeyType: HASH }, { AttributeName: sk, KeyType: RANGE }]
+
+  # ---------------------------------------------------------------- Messaging
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub aegisgrid-${Stage}
+
+  EventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub aegisgrid-${Stage}-events-dlq
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  EventsDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EventsDLQ]
+      PolicyDocument:
+        Statement:
+          - Sid: AllowEventBridgeDeadLetters
+            Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventsDLQ.Arn
+            Condition: { StringEquals: { aws:SourceAccount: !Ref AWS::AccountId } }
+
+  DispatchTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub aegisgrid-${Stage}-dispatch
+      DisplayName: AegisGrid
+      KmsMasterKeyId: alias/aws/sns
+
+  ControlRoomSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasControlRoomEmail
+    Properties:
+      TopicArn: !Ref DispatchTopic
+      Protocol: email
+      Endpoint: !Ref ControlRoomEmail
+      FilterPolicy: { department: [CONTROL_ROOM] }
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub aegisgrid-${Stage}-alarms
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties: { TopicArn: !Ref AlarmTopic, Protocol: email, Endpoint: !Ref AlarmEmail }
+
+  # ---------------------------------------------------------------- API
+  AegisApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub aegisgrid-${Stage}-api
+      StageName: !Ref Stage
+      TracingEnabled: true
+      EndpointConfiguration: { Type: REGIONAL }
+      Cors:
+        AllowOrigin: !Sub "'${CorsOrigin}'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowMethods: "'GET,POST,PUT,PATCH,OPTIONS'"
+      Auth:
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 50
+          ThrottlingBurstLimit: 100
+          MetricsEnabled: true
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers: { Access-Control-Allow-Origin: !Sub "'${CorsOrigin}'", Access-Control-Allow-Headers: "'Content-Type,Authorization'" }
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers: { Access-Control-Allow-Origin: !Sub "'${CorsOrigin}'", Access-Control-Allow-Headers: "'Content-Type,Authorization'" }
+
+  # ---------------------------------------------------------------- Orchestration
+  IncidentAnalysisStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub aegisgrid-${Stage}-incident-analysis
+      Type: STANDARD
+      DefinitionUri: statemachine/incident-analysis.asl.json
+      DefinitionSubstitutions:
+        PrepareAnalysisFunctionArn: !GetAtt PrepareAnalysisFunction.Arn
+        AnalyzeImageFunctionArn: !GetAtt AnalyzeImageFunction.Arn
+        FetchTranscriptFunctionArn: !GetAtt FetchTranscriptFunction.Arn
+        AnalyzeTextFunctionArn: !GetAtt AnalyzeTextFunction.Arn
+        AssessIncidentFunctionArn: !GetAtt AssessIncidentFunction.Arn
+        MarkFailedFunctionArn: !GetAtt MarkFailedFunction.Arn
+        MediaBucket: !Ref MediaBucket
+        EventBusName: !Ref EventBus
+      Tracing: { Enabled: true }
+      Logging:
+        Level: ERROR
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup: { LogGroupArn: !GetAtt StateMachineLogGroup.Arn }
+      Policies:
+        - LambdaInvokePolicy: { FunctionName: !Ref PrepareAnalysisFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref AnalyzeImageFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref FetchTranscriptFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref AnalyzeTextFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref AssessIncidentFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref MarkFailedFunction }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+        - Statement:
+            - Effect: Allow
+              Action: [transcribe:StartTranscriptionJob, transcribe:GetTranscriptionJob]
+              Resource: "*"
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${MediaBucket.Arn}/incidents/*"
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${MediaBucket.Arn}/transcripts/*"
+            - Effect: Allow
+              Action: [logs:CreateLogDelivery, logs:GetLogDelivery, logs:UpdateLogDelivery, logs:DeleteLogDelivery, logs:ListLogDeliveries, logs:PutResourcePolicy, logs:DescribeResourcePolicies, logs:DescribeLogGroups]
+              Resource: "*"
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/states/aegisgrid-${Stage}-incident-analysis
+      RetentionInDays: 7
+
+  # ---------------------------------------------------------------- Functions
+  CreateIncidentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/api/create-incident.ts]
+    Properties:
+      Handler: create-incident.handler
+      Description: "POST /incidents - signed-in citizen requests emergency help"
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref IncidentAnalysisStateMachine
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref CitizensTable }
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${MediaBucket.Arn}/incidents/*"
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref IncidentAnalysisStateMachine
+      Events:
+        Api:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/incidents", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+
+  SubmitIncidentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/api/submit-incident.ts]
+    Properties:
+      Handler: submit-incident.handler
+      Description: "POST /incidents/{incidentId}/submit - start analysis after media upload"
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref IncidentAnalysisStateMachine
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${MediaBucket.Arn}/incidents/*"
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt MediaBucket.Arn
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref IncidentAnalysisStateMachine
+      Events:
+        Api:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/incidents/{incidentId}/submit", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+
+  GetIncidentStatusFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/api/get-incident-status.ts]
+    Properties:
+      Handler: get-incident-status.handler
+      Description: "GET /incidents/{incidentId}/status - live status for the requesting citizen"
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref IncidentsTable }
+      Events:
+        Api:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/incidents/{incidentId}/status", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+
+  ListMyIncidentsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/api/list-my-incidents.ts]
+    Properties:
+      Handler: list-my-incidents.handler
+      Description: "GET /me/incidents - citizen request history with response times"
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref IncidentsTable }
+      Events:
+        Api:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/me/incidents", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+
+  UpdateMyLocationFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/api/update-my-location.ts]
+    Properties:
+      Handler: update-my-location.handler
+      Description: "PATCH /me/incidents/{incidentId}/location - live GPS from the citizen's device"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+      Events:
+        Api:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/me/incidents/{incidentId}/location", Method: patch, Auth: { Authorizer: CognitoAuthorizer } }
+
+  ListServicesFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/api/list-services.ts]
+    Properties:
+      Handler: list-services.handler
+      Description: "GET /services - the eight services and their approved stations"
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref StationsTable }
+      Events:
+        Api:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/services", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+
+  CitizenProfileFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/api/citizen-profile.ts]
+    Properties:
+      Handler: citizen-profile.handler
+      Description: "Citizen trust standing and phone verification (/me/profile, /me/phone)"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref CitizensTable }
+        - Statement:
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: "*"
+            - Effect: Allow
+              Action: sns:Publish
+              NotResource: "arn:aws:sns:*:*:*"
+      Events:
+        Route0:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/me/profile", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+        Route1:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/me/phone/send", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+        Route2:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/me/phone/verify", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+
+  MyAccountFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/api/my-account.ts]
+    Properties:
+      Handler: my-account.handler
+      Description: "Own account: profile changes (audited) and activity history"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref CitizensTable }
+        - Statement:
+            - Effect: Allow
+              Action: [cognito-idp:AdminUpdateUserAttributes, cognito-idp:AdminDeleteUserAttributes]
+              Resource: !GetAtt UserPool.Arn
+      Events:
+        Route0:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/me/activity", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+        Route1:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/me/activity", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+        Route2:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/me/account", Method: patch, Auth: { Authorizer: CognitoAuthorizer } }
+
+  # Cognito trigger: sign-ups and sign-ins on the account activity log.
+  AuthActivityFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/platform/auth-activity.ts]
+    Properties:
+      Handler: auth-activity.handler
+      Description: "Cognito trigger: records account creation and sign-ins"
+      Timeout: 5
+      Environment:
+        Variables:
+          USER_POOL_ID: "" # the pool references this function; referencing it back would be circular
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+
+  AuthActivityPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt AuthActivityFunction.Arn
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  StationProfileFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/station/station-profile.ts]
+    Properties:
+      Handler: station-profile.handler
+      Description: "Station registration, verification and operations (/station/me)"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref StationsTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${MediaBucket.Arn}/stations/*"
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: "*"
+            - Effect: Allow
+              Action: sns:Publish
+              NotResource: "arn:aws:sns:*:*:*"
+      Events:
+        Route0:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/station/me", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+        Route1:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/station/me", Method: put, Auth: { Authorizer: CognitoAuthorizer } }
+        Route2:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/station/me", Method: patch, Auth: { Authorizer: CognitoAuthorizer } }
+        Route3:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/station/me/{action}", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+
+  StationOffersFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/station/station-offers.ts]
+    Properties:
+      Handler: station-offers.handler
+      Description: "Station inbox: accept, transfer, arrive (OTP), complete (OTP), false alarm"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref CitizensTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref StationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OffersTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+      Events:
+        Route0:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/station/offers", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+        Route1:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/station/offers/{offerId}/{action}", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+
+  AdminApiFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/admin/admin-api.ts]
+    Properties:
+      Handler: admin-api.handler
+      Description: "Admin: full control of stations, users and requests"
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref CitizensTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref StationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OffersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+        - Statement:
+            - Effect: Allow
+              Action: [cognito-idp:ListUsers, cognito-idp:ListUsersInGroup, cognito-idp:AdminAddUserToGroup, cognito-idp:AdminRemoveUserFromGroup, cognito-idp:AdminDisableUser, cognito-idp:AdminEnableUser, cognito-idp:AdminDeleteUser]
+              Resource: !GetAtt UserPool.Arn
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${MediaBucket.Arn}/stations/*"
+      Events:
+        Route0:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/overview", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+        Route1:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/incidents", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+        Route2:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/incidents/{incidentId}", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+        Route3:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/incidents/{incidentId}/assign", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+        Route4:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/incidents/{incidentId}/resolve", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+        Route5:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/stations", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+        Route6:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/stations/{stationId}", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+        Route7:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/stations/{stationId}/review", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+        Route8:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/users", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+        Route9:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/users/{username}/action", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+        Route10:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/citizens/{userId}/standing", Method: post, Auth: { Authorizer: CognitoAuthorizer } }
+        Route11:
+          Type: Api
+          Properties: { RestApiId: !Ref AegisApi, Path: "/admin/activity/{userId}", Method: get, Auth: { Authorizer: CognitoAuthorizer } }
+
+  PrepareAnalysisFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/analysis/prepare-analysis.ts]
+    Properties:
+      Handler: prepare-analysis.handler
+      Description: "Workflow: load incident and fan out media"
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref IncidentsTable }
+
+  AnalyzeImageFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/analysis/analyze-image.ts]
+    Properties:
+      Handler: analyze-image.handler
+      Description: "Workflow: Amazon Rekognition labels and photo EXIF (capture time, GPS)"
+      Policies:
+        - RekognitionDetectOnlyPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${MediaBucket.Arn}/incidents/*"
+
+  FetchTranscriptFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/analysis/fetch-transcript.ts]
+    Properties:
+      Handler: fetch-transcript.handler
+      Description: "Workflow: read Amazon Transcribe output"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${MediaBucket.Arn}/transcripts/*"
+
+  AnalyzeTextFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/analysis/analyze-text.ts]
+    Properties:
+      Handler: analyze-text.handler
+      Description: "Workflow: Amazon Translate + Amazon Comprehend"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - Statement:
+            - Effect: Allow
+              Action: [comprehend:DetectDominantLanguage, comprehend:DetectEntities, comprehend:DetectKeyPhrases, comprehend:DetectSentiment, translate:TranslateText]
+              Resource: "*"
+
+  AssessIncidentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/analysis/assess-incident.ts]
+    Properties:
+      Handler: assess-incident.handler
+      Description: "Workflow: hybrid triage (Bedrock + rules), duplicate and credibility checks"
+      Timeout: 60
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref CitizensTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+        - Statement:
+            - Effect: Allow
+              Action: [bedrock:InvokeModel, bedrock-mantle:CreateInference]
+              Resource: "*"
+
+  MarkFailedFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/analysis/mark-failed.ts]
+    Properties:
+      Handler: mark-failed.handler
+      Description: "Workflow: flag failed analysis and escalate"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+
+  AmbulanceAgentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/agents/service-agent.ts]
+    Properties:
+      Handler: service-agent.handler
+      Description: "Ambulance Agent: offers requests to the nearest approved station"
+      Timeout: 30
+      Environment:
+        Variables:
+          SERVICE_TYPE: AMBULANCE
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref StationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OffersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+      Events:
+        OnIncidentAssessed:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern:
+              source: [aegisgrid.orchestrator]
+              detail-type: [Incident.Assessed]
+              detail:
+                requiredAgents: [AMBULANCE]
+            RetryPolicy: { MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 900 }
+            DeadLetterConfig: { Arn: !GetAtt EventsDLQ.Arn }
+
+  FireAgentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/agents/service-agent.ts]
+    Properties:
+      Handler: service-agent.handler
+      Description: "Fire Agent: offers requests to the nearest approved station"
+      Timeout: 30
+      Environment:
+        Variables:
+          SERVICE_TYPE: FIRE
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref StationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OffersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+      Events:
+        OnIncidentAssessed:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern:
+              source: [aegisgrid.orchestrator]
+              detail-type: [Incident.Assessed]
+              detail:
+                requiredAgents: [FIRE]
+            RetryPolicy: { MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 900 }
+            DeadLetterConfig: { Arn: !GetAtt EventsDLQ.Arn }
+
+  PoliceAgentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/agents/service-agent.ts]
+    Properties:
+      Handler: service-agent.handler
+      Description: "Police Agent: offers requests to the nearest approved station"
+      Timeout: 30
+      Environment:
+        Variables:
+          SERVICE_TYPE: POLICE
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref StationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OffersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+      Events:
+        OnIncidentAssessed:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern:
+              source: [aegisgrid.orchestrator]
+              detail-type: [Incident.Assessed]
+              detail:
+                requiredAgents: [POLICE]
+            RetryPolicy: { MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 900 }
+            DeadLetterConfig: { Arn: !GetAtt EventsDLQ.Arn }
+
+  TrafficPoliceAgentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/agents/service-agent.ts]
+    Properties:
+      Handler: service-agent.handler
+      Description: "TrafficPolice Agent: offers requests to the nearest approved station"
+      Timeout: 30
+      Environment:
+        Variables:
+          SERVICE_TYPE: TRAFFIC_POLICE
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref StationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OffersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+      Events:
+        OnIncidentAssessed:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern:
+              source: [aegisgrid.orchestrator]
+              detail-type: [Incident.Assessed]
+              detail:
+                requiredAgents: [TRAFFIC_POLICE]
+            RetryPolicy: { MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 900 }
+            DeadLetterConfig: { Arn: !GetAtt EventsDLQ.Arn }
+
+  HospitalAgentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/agents/service-agent.ts]
+    Properties:
+      Handler: service-agent.handler
+      Description: "Hospital Agent: offers requests to the nearest approved station"
+      Timeout: 30
+      Environment:
+        Variables:
+          SERVICE_TYPE: HOSPITAL
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref StationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OffersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+      Events:
+        OnIncidentAssessed:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern:
+              source: [aegisgrid.orchestrator]
+              detail-type: [Incident.Assessed]
+              detail:
+                requiredAgents: [HOSPITAL]
+            RetryPolicy: { MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 900 }
+            DeadLetterConfig: { Arn: !GetAtt EventsDLQ.Arn }
+
+  DisasterResponseAgentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/agents/service-agent.ts]
+    Properties:
+      Handler: service-agent.handler
+      Description: "DisasterResponse Agent: offers requests to the nearest approved station"
+      Timeout: 30
+      Environment:
+        Variables:
+          SERVICE_TYPE: DISASTER_RESPONSE
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref StationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OffersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+      Events:
+        OnIncidentAssessed:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern:
+              source: [aegisgrid.orchestrator]
+              detail-type: [Incident.Assessed]
+              detail:
+                requiredAgents: [DISASTER_RESPONSE]
+            RetryPolicy: { MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 900 }
+            DeadLetterConfig: { Arn: !GetAtt EventsDLQ.Arn }
+
+  WomenChildSafetyAgentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/agents/service-agent.ts]
+    Properties:
+      Handler: service-agent.handler
+      Description: "WomenChildSafety Agent: offers requests to the nearest approved station"
+      Timeout: 30
+      Environment:
+        Variables:
+          SERVICE_TYPE: WOMEN_CHILD_SAFETY
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref StationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OffersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+      Events:
+        OnIncidentAssessed:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern:
+              source: [aegisgrid.orchestrator]
+              detail-type: [Incident.Assessed]
+              detail:
+                requiredAgents: [WOMEN_CHILD_SAFETY]
+            RetryPolicy: { MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 900 }
+            DeadLetterConfig: { Arn: !GetAtt EventsDLQ.Arn }
+
+  UtilityEmergencyAgentFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/agents/service-agent.ts]
+    Properties:
+      Handler: service-agent.handler
+      Description: "UtilityEmergency Agent: offers requests to the nearest approved station"
+      Timeout: 30
+      Environment:
+        Variables:
+          SERVICE_TYPE: UTILITY_EMERGENCY
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref StationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OffersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+      Events:
+        OnIncidentAssessed:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern:
+              source: [aegisgrid.orchestrator]
+              detail-type: [Incident.Assessed]
+              detail:
+                requiredAgents: [UTILITY_EMERGENCY]
+            RetryPolicy: { MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 900 }
+            DeadLetterConfig: { Arn: !GetAtt EventsDLQ.Arn }
+
+  OfferSweeperFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/platform/offer-sweeper.ts]
+    Properties:
+      Handler: offer-sweeper.handler
+      Description: "Every minute: moves unaccepted requests to the next nearest station"
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref StationsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref OffersTable }
+        - EventBridgePutEventsPolicy: { EventBusName: !Ref EventBus }
+      Events:
+        EveryMinute:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(1 minute)
+
+  NotifierFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/platform/notifier.ts]
+    Properties:
+      Handler: notifier.handler
+      Description: "Notifier: SNS per service, SES to stations, optional citizen SMS"
+      Timeout: 30
+      Policies:
+        - SNSPublishMessagePolicy: { TopicName: !GetAtt DispatchTopic.TopicName }
+        - DynamoDBReadPolicy: { TableName: !Ref IncidentsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref StationsTable }
+        - Statement:
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DepartmentDirectoryParameter}"
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: "*"
+            - Effect: Allow
+              Action: sns:Publish
+              NotResource: "arn:aws:sns:*:*:*"
+      Events:
+        OnNotifiableEvent:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern:
+              source: [{ prefix: aegisgrid. }]
+              detail-type: [Incident.Assessed, Incident.AnalysisFailed, Incident.Resolved, Offer.Created, Offer.Accepted, Offer.Transferred, Offer.Expired, Service.Arrived, Service.Completed, Service.Unavailable, Service.FalseAlarm, Incident.DuplicateLinked, Station.Submitted, Station.Reviewed]
+            RetryPolicy: { MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 900 }
+            DeadLetterConfig: { Arn: !GetAtt EventsDLQ.Arn }
+
+  EventRecorderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/platform/event-recorder.ts]
+    Properties:
+      Handler: event-recorder.handler
+      Description: "Timeline recorder: incident audit trail and per-account activity logs"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TimelineTable }
+        - DynamoDBReadPolicy: { TableName: !Ref IncidentsTable }
+      Events:
+        OnAnyEvent:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBus
+            Pattern:
+              source: [{ prefix: aegisgrid. }]
+            RetryPolicy: { MaximumRetryAttempts: 4, MaximumEventAgeInSeconds: 900 }
+            DeadLetterConfig: { Arn: !GetAtt EventsDLQ.Arn }
+
+  AnalyticsExportFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints: [src/handlers/platform/analytics-export.ts]
+    Properties:
+      Handler: analytics-export.handler
+      Description: "DynamoDB Streams -> S3 analytics lake (Glue catalog, queryable with Athena)"
+      Policies:
+        - S3WritePolicy: { BucketName: !Ref AnalyticsBucket }
+        - SQSSendMessagePolicy: { QueueName: !GetAtt EventsDLQ.QueueName }
+      Events:
+        IncidentStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt IncidentsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 50
+            MaximumBatchingWindowInSeconds: 10
+            MaximumRetryAttempts: 5
+            BisectBatchOnFunctionError: true
+            DestinationConfig: { OnFailure: { Destination: !GetAtt EventsDLQ.Arn } }
+
+  # ---------------------------------------------------------------- Log retention
+  MyAccountLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${MyAccountFunction}
+      RetentionInDays: 7
+  AuthActivityLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AuthActivityFunction}
+      RetentionInDays: 7
+  CitizenProfileLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CitizenProfileFunction}
+      RetentionInDays: 7
+  CreateIncidentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CreateIncidentFunction}
+      RetentionInDays: 7
+  SubmitIncidentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${SubmitIncidentFunction}
+      RetentionInDays: 7
+  GetIncidentStatusLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${GetIncidentStatusFunction}
+      RetentionInDays: 7
+  ListMyIncidentsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ListMyIncidentsFunction}
+      RetentionInDays: 7
+  UpdateMyLocationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${UpdateMyLocationFunction}
+      RetentionInDays: 7
+  ListServicesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ListServicesFunction}
+      RetentionInDays: 7
+  StationProfileLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${StationProfileFunction}
+      RetentionInDays: 7
+  StationOffersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${StationOffersFunction}
+      RetentionInDays: 7
+  AdminApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AdminApiFunction}
+      RetentionInDays: 7
+  PrepareAnalysisLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PrepareAnalysisFunction}
+      RetentionInDays: 7
+  AnalyzeImageLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AnalyzeImageFunction}
+      RetentionInDays: 7
+  FetchTranscriptLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FetchTranscriptFunction}
+      RetentionInDays: 7
+  AnalyzeTextLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AnalyzeTextFunction}
+      RetentionInDays: 7
+  AssessIncidentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AssessIncidentFunction}
+      RetentionInDays: 7
+  MarkFailedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${MarkFailedFunction}
+      RetentionInDays: 7
+  AmbulanceAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AmbulanceAgentFunction}
+      RetentionInDays: 7
+  FireAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FireAgentFunction}
+      RetentionInDays: 7
+  PoliceAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PoliceAgentFunction}
+      RetentionInDays: 7
+  TrafficPoliceAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${TrafficPoliceAgentFunction}
+      RetentionInDays: 7
+  HospitalAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${HospitalAgentFunction}
+      RetentionInDays: 7
+  DisasterResponseAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${DisasterResponseAgentFunction}
+      RetentionInDays: 7
+  WomenChildSafetyAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WomenChildSafetyAgentFunction}
+      RetentionInDays: 7
+  UtilityEmergencyAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${UtilityEmergencyAgentFunction}
+      RetentionInDays: 7
+  OfferSweeperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${OfferSweeperFunction}
+      RetentionInDays: 7
+  NotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${NotifierFunction}
+      RetentionInDays: 7
+  EventRecorderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${EventRecorderFunction}
+      RetentionInDays: 7
+  AnalyticsExportLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AnalyticsExportFunction}
+      RetentionInDays: 7
+
+  # ---------------------------------------------------------------- Monitoring
+  AssessIncidentErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub aegisgrid-${Stage}-AssessIncident-errors
+      AlarmDescription: AssessIncidentFunction is failing; requests may not reach or progress at stations.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref AssessIncidentFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  StationOffersErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub aegisgrid-${Stage}-StationOffers-errors
+      AlarmDescription: StationOffersFunction is failing; requests may not reach or progress at stations.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref StationOffersFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  AdminApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub aegisgrid-${Stage}-AdminApi-errors
+      AlarmDescription: AdminApiFunction is failing; requests may not reach or progress at stations.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref AdminApiFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  OfferSweeperErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub aegisgrid-${Stage}-OfferSweeper-errors
+      AlarmDescription: OfferSweeperFunction is failing; requests may not reach or progress at stations.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref OfferSweeperFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+  NotifierErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub aegisgrid-${Stage}-Notifier-errors
+      AlarmDescription: NotifierFunction is failing; requests may not reach or progress at stations.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref NotifierFunction }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  AnalysisFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub aegisgrid-${Stage}-analysis-failed
+      AlarmDescription: An incident analysis workflow failed; the control room was escalated.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions: [{ Name: StateMachineArn, Value: !Ref IncidentAnalysisStateMachine }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  EventsDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub aegisgrid-${Stage}-events-dlq
+      AlarmDescription: Agent events could not be delivered after retries.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt EventsDLQ.QueueName }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub aegisgrid-${Stage}-api-5xx
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions: [{ Name: ApiName, Value: !Sub "aegisgrid-${Stage}-api" }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub aegisgrid-${Stage}-operations
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": { "title": "Incident workflows", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["AWS/States", "ExecutionsStarted", "StateMachineArn", "${IncidentAnalysisStateMachine}"],
+                  [".", "ExecutionsSucceeded", ".", "."],
+                  [".", "ExecutionsFailed", ".", "."] ] } },
+            { "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": { "title": "Workflow duration (ms)", "region": "${AWS::Region}", "period": 300,
+                "metrics": [
+                  ["AWS/States", "ExecutionTime", "StateMachineArn", "${IncidentAnalysisStateMachine}", { "stat": "p50" }],
+                  ["...", { "stat": "p95" }] ] } },
+            { "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": { "title": "Agent invocations", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${AmbulanceAgentFunction}"],
+                  ["...", "${FireAgentFunction}"],
+                  ["...", "${PoliceAgentFunction}"],
+                  ["...", "${TrafficPoliceAgentFunction}"],
+                  ["...", "${HospitalAgentFunction}"],
+                  ["...", "${DisasterResponseAgentFunction}"],
+                  ["...", "${WomenChildSafetyAgentFunction}"],
+                  ["...", "${UtilityEmergencyAgentFunction}"] ] } },
+            { "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": { "title": "Agent errors", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${AmbulanceAgentFunction}"],
+                  ["...", "${FireAgentFunction}"],
+                  ["...", "${PoliceAgentFunction}"],
+                  ["...", "${TrafficPoliceAgentFunction}"],
+                  ["...", "${HospitalAgentFunction}"],
+                  ["...", "${DisasterResponseAgentFunction}"],
+                  ["...", "${WomenChildSafetyAgentFunction}"],
+                  ["...", "${UtilityEmergencyAgentFunction}"],
+                  ["...", "${AssessIncidentFunction}"] ] } },
+            { "type": "metric", "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": { "title": "Bedrock assessment latency (ms)", "region": "${AWS::Region}", "period": 300,
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${AssessIncidentFunction}", { "stat": "p50" }],
+                  ["...", { "stat": "p95" }] ] } },
+            { "type": "metric", "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": { "title": "API requests and errors", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "aegisgrid-${Stage}-api"],
+                  [".", "4XXError", ".", "."],
+                  [".", "5XXError", ".", "."] ] } }
+          ]
+        }
+
+  # ---------------------------------------------------------------- Analytics (Athena / QuickSight)
+  AnalyticsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub aegisgrid_${Stage}
+        Description: AegisGrid incident analytics
+
+  IncidentsAnalyticsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref AnalyticsDatabase
+      TableInput:
+        Name: incidents
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: "true"
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: 2026-01-01,NOW
+          projection.dt.interval: "1"
+          projection.dt.interval.unit: DAYS
+          storage.location.template: !Sub "s3://${AnalyticsBucket}/incidents/dt=${!dt}/"
+        PartitionKeys: [{ Name: dt, Type: string }]
+        StorageDescriptor:
+          Location: !Sub "s3://${AnalyticsBucket}/incidents/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo: { SerializationLibrary: org.openx.data.jsonserde.JsonSerDe }
+          Columns:
+            - { Name: incident_id, Type: string }
+            - { Name: status, Type: string }
+            - { Name: created_at, Type: string }
+            - { Name: updated_at, Type: string }
+            - { Name: resolved_at, Type: string }
+            - { Name: incident_type, Type: string }
+            - { Name: severity, Type: int }
+            - { Name: confidence, Type: int }
+            - { Name: estimated_casualties, Type: int }
+            - { Name: assessment_source, Type: string }
+            - { Name: required_agents, Type: string }
+            - { Name: language, Type: string }
+            - { Name: media_count, Type: int }
+            - { Name: latitude, Type: double }
+            - { Name: longitude, Type: double }
+            - { Name: ambulance_eta_min, Type: int }
+            - { Name: police_eta_min, Type: int }
+            - { Name: fire_eta_min, Type: int }
+            - { Name: hospital_id, Type: string }
+            - { Name: signals_held, Type: int }
+            - { Name: units_dispatched, Type: int }
+            - { Name: time_to_dispatch_min, Type: double }
+            - { Name: time_to_resolve_min, Type: double }
+
+  AnalyticsWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub aegisgrid-${Stage}
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AnalyticsBucket}/athena-results/"
+          EncryptionConfiguration: { EncryptionOption: SSE_S3 }
+
+  # ---------------------------------------------------------------- Cost guard
+  SpendingBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasAlarmEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub aegisgrid-${Stage}-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 50, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlarmEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlarmEmail }]
+
+  # ---------------------------------------------------------------- Frontend hosting (S3 + CloudFront)
+  # The React app is served from a private S3 bucket through CloudFront (Always Free:
+  # 1 TB / 10M requests a month). HTTPS is required for the browser's GPS and microphone APIs,
+  # which a plain S3 website endpoint (HTTP only) cannot provide.
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub aegisgrid-${Stage}-web-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub aegisgrid-${Stage}-web-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub AegisGrid ${Stage} web app
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_All
+        DefaultRootObject: index.html
+        Origins:
+          - Id: web
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+        # Single-page app: unknown paths (e.g. /incidents/123) serve index.html
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 0 }
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 0 }
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt FrontendBucket.Arn, !Sub "${FrontendBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+
+Outputs:
+  WebsiteUrl:
+    Description: Public HTTPS URL of the AegisGrid web app (after running scripts/deploy-frontend.sh)
+    Value: !Sub "https://${FrontendDistribution.DomainName}"
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  FrontendDistributionId:
+    Value: !Ref FrontendDistribution
+  ApiUrl:
+    Description: Base URL of the AegisGrid REST API
+    Value: !Sub "https://${AegisApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Description: Hosted sign-in domain (frontend VITE_COGNITO_DOMAIN)
+    Value: !Sub "${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
+  GoogleRedirectUri:
+    Description: Add this as an Authorized redirect URI on the Google OAuth client
+    Value: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/idpresponse"
+  GoogleSignInEnabled:
+    Value: !If [HasGoogle, "true", "false"]
+  IncidentsTableName:
+    Value: !Ref IncidentsTable
+  StationsTableName:
+    Value: !Ref StationsTable
+  OffersTableName:
+    Value: !Ref OffersTable
+  TimelineTableName:
+    Value: !Ref TimelineTable
+  MediaBucketName:
+    Value: !Ref MediaBucket
+  AnalyticsBucketName:
+    Value: !Ref AnalyticsBucket
+  EventBusName:
+    Value: !Ref EventBus
+  StateMachineArn:
+    Value: !Ref IncidentAnalysisStateMachine
+  DispatchTopicArn:
+    Description: Subscribe departments here with a filter policy on the `department` attribute
+    Value: !Ref DispatchTopic
+  DepartmentDirectoryParameter:
+    Value: !Ref DepartmentDirectoryParameter
+  AthenaWorkGroup:
+    Value: !Ref AnalyticsWorkGroup
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=aegisgrid-${Stage}-operations"

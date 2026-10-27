@@ -1,0 +1,314 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-black text-white font-sans;
+    background-color: #090909;
+    color: #ffffff;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: #111111;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: #E50914;
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #ff1a1e;
+  }
+
+  ::selection {
+    background: rgba(229, 9, 20, 0.4);
+    color: #ffffff;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-black-200 border border-white/10 rounded-xl backdrop-blur-sm;
+    background: rgba(26, 26, 26, 0.8);
+  }
+
+  .glass-card-red {
+    @apply border border-red-500/30 rounded-xl backdrop-blur-sm;
+    background: rgba(229, 9, 20, 0.08);
+  }
+
+  .btn-primary {
+    @apply bg-red-500 hover:bg-red-600 text-white font-semibold px-6 py-3 rounded-lg
+           transition-all duration-200 flex items-center gap-2 cursor-pointer
+           active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-black-300 hover:bg-black-400 text-white font-medium px-5 py-2.5 rounded-lg
+           border border-white/10 hover:border-white/20 transition-all duration-200
+           flex items-center gap-2 cursor-pointer;
+  }
+
+  .btn-outline-red {
+    @apply border border-red-500 text-red-500 hover:bg-red-500 hover:text-white
+           font-medium px-5 py-2.5 rounded-lg transition-all duration-200
+           flex items-center gap-2 cursor-pointer;
+  }
+
+  .input-field {
+    @apply bg-black-300 border border-white/10 rounded-lg px-4 py-3 text-white
+           placeholder-white/30 focus:outline-none focus:border-red-500/60 
+           focus:ring-1 focus:ring-red-500/30 transition-all duration-200 w-full;
+  }
+
+  .select-field {
+    @apply bg-black-300 border border-white/10 rounded-lg px-4 py-3 text-white
+           focus:outline-none focus:border-red-500/60 focus:ring-1 focus:ring-red-500/30
+           transition-all duration-200 w-full appearance-none cursor-pointer;
+  }
+
+  .kpi-card {
+    @apply glass-card p-5 flex flex-col gap-3 hover:border-white/20 transition-all duration-200;
+  }
+
+  .status-badge {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold;
+  }
+
+  .badge-critical {
+    @apply status-badge bg-red-500/20 text-red-400 border border-red-500/30;
+  }
+
+  .badge-active {
+    @apply status-badge bg-orange-500/20 text-orange-400 border border-orange-500/30;
+  }
+
+  .badge-resolved {
+    @apply status-badge bg-green-500/20 text-green-400 border border-green-500/30;
+  }
+
+  .badge-pending {
+    @apply status-badge bg-yellow-500/20 text-yellow-400 border border-yellow-500/30;
+  }
+
+  .badge-demo {
+    @apply status-badge bg-purple-500/20 text-purple-400 border border-purple-500/30;
+  }
+
+  .badge-simulated {
+    @apply status-badge bg-blue-500/20 text-blue-400 border border-blue-500/30;
+  }
+
+  .badge-dispatched {
+    @apply status-badge bg-blue-500/20 text-blue-400 border border-blue-500/30;
+  }
+
+  .nav-link {
+    @apply flex items-center gap-3 px-4 py-3 rounded-lg text-white/60 hover:text-white
+           hover:bg-white/5 transition-all duration-200 font-medium cursor-pointer;
+  }
+
+  .nav-link-active {
+    @apply flex items-center gap-3 px-4 py-3 rounded-lg text-white bg-red-500/15
+           border border-red-500/20 font-medium cursor-pointer;
+  }
+
+  .section-header {
+    @apply flex items-center gap-3 mb-6;
+  }
+
+  .section-title {
+    @apply text-xl font-bold text-white;
+  }
+
+  .label {
+    @apply text-sm font-medium text-white/70 mb-2 block;
+  }
+
+  .demo-label {
+    @apply text-xs font-mono text-purple-400 uppercase tracking-wider;
+  }
+
+  .animate-counter {
+    transition: all 0.5s ease-out;
+  }
+}
+
+/* Leaflet map dark theme overrides */
+.leaflet-container {
+  background: #111111 !important;
+  font-family: 'Inter', sans-serif;
+}
+
+.leaflet-tile-pane {
+  filter: brightness(0.7) saturate(0.8);
+}
+
+.leaflet-control-zoom {
+  border: 1px solid rgba(255,255,255,0.1) !important;
+  background: #1a1a1a !important;
+}
+
+.leaflet-control-zoom a {
+  background: #1a1a1a !important;
+  color: #ffffff !important;
+  border-bottom-color: rgba(255,255,255,0.1) !important;
+}
+
+.leaflet-control-zoom a:hover {
+  background: #222222 !important;
+}
+
+.leaflet-control-attribution {
+  background: rgba(9, 9, 9, 0.7) !important;
+  color: rgba(255,255,255,0.4) !important;
+  font-size: 10px !important;
+}
+
+.leaflet-control-attribution a {
+  color: rgba(229, 9, 20, 0.6) !important;
+}
+
+/* Custom map popup */
+.leaflet-popup-content-wrapper {
+  background: #1a1a1a !important;
+  color: #ffffff !important;
+  border: 1px solid rgba(229, 9, 20, 0.3) !important;
+  border-radius: 8px !important;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5) !important;
+}
+
+.leaflet-popup-tip {
+  background: #1a1a1a !important;
+}
+
+/* Recharts dark theme */
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line {
+  stroke: rgba(255,255,255,0.05);
+}
+
+.recharts-text {
+  fill: rgba(255,255,255,0.5);
+  font-size: 12px;
+}
+
+/* Custom incident marker */
+.incident-marker {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 3px solid white;
+  box-shadow: 0 0 0 4px rgba(229, 9, 20, 0.4), 0 4px 12px rgba(0,0,0,0.5);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.incident-marker:hover {
+  transform: scale(1.2);
+}
+
+/* Loading shimmer */
+@keyframes shimmer {
+  0% { background-position: -1000px 0; }
+  100% { background-position: 1000px 0; }
+}
+
+.shimmer {
+  background: linear-gradient(90deg, #1a1a1a 25%, #222 50%, #1a1a1a 75%);
+  background-size: 1000px 100%;
+  animation: shimmer 2s infinite;
+}
+
+/* Demo banner glow */
+@keyframes demo-glow {
+  0%, 100% { box-shadow: 0 0 10px rgba(229, 9, 20, 0.3); }
+  50% { box-shadow: 0 0 20px rgba(229, 9, 20, 0.6); }
+}
+
+.demo-banner {
+  animation: demo-glow 3s ease-in-out infinite;
+}
+
+/* Agent status pulse */
+@keyframes agent-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.05); opacity: 0.8; }
+}
+
+.agent-active {
+  animation: agent-pulse 2s ease-in-out infinite;
+}
+
+/* Notification toast animation */
+@keyframes toast-in {
+  from { transform: translateX(110%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+@keyframes toast-out {
+  from { transform: translateX(0); opacity: 1; }
+  to { transform: translateX(110%); opacity: 0; }
+}
+
+.toast-enter {
+  animation: toast-in 0.3s ease-out forwards;
+}
+
+.toast-exit {
+  animation: toast-out 0.3s ease-in forwards;
+}
+
+/* Page transition */
+.page-enter {
+  animation: fade-in 0.3s ease-out;
+}
+
+/* ── Live map markers (shared by Google Maps and Leaflet) ───────────────── */
+.lm-leaflet-icon { background: transparent; border: none; }
+/* OpenStreetMap tiles turned into a dark basemap */
+.lm-dark .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9) saturate(0.6); }
+.lm-pin { position: relative; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+.lm-incident {
+  position: relative; z-index: 1; width: 28px; height: 28px; border-radius: 9999px;
+  display: flex; align-items: center; justify-content: center;
+  border: 2px solid rgba(255,255,255,0.9); box-shadow: 0 2px 10px rgba(0,0,0,0.6);
+}
+.lm-pulse { position: absolute; inset: 0; border-radius: 9999px; animation: lm-pulse 1.8s ease-out infinite; }
+@keyframes lm-pulse { 0% { transform: scale(0.9); opacity: 0.7; } 100% { transform: scale(2.4); opacity: 0; } }
+.lm-unit {
+  position: relative; width: 26px; height: 26px; border-radius: 7px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  background: #121212; border: 1.5px solid; box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+}
+.lm-status { position: absolute; top: -3px; right: -3px; width: 8px; height: 8px; border-radius: 9999px; border: 1.5px solid #121212; }
+.lm-signal { display: block; width: 12px; height: 12px; border-radius: 9999px; background: #525252; border: 2px solid #1f1f1f; cursor: pointer; }
+.lm-signal-on { background: #22c55e; box-shadow: 0 0 0 4px rgba(34,197,94,0.25), 0 0 12px rgba(34,197,94,0.8); }
+
+.lm-card { min-width: 190px; max-width: 260px; font-family: 'Inter', sans-serif; font-size: 12px; line-height: 1.45; }
+.lm-card-title { font-weight: 700; font-size: 13px; margin-bottom: 4px; }
+.lm-card-row { margin-top: 2px; }
+.lm-muted { opacity: 0.65; }
+.lm-card-link { margin-top: 8px; font-weight: 600; color: #E50914; background: none; border: none; padding: 0; cursor: pointer; }
+/* Google InfoWindow is white; keep the card readable there */
+.gm-style .lm-card { color: #111; }

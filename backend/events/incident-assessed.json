@@ -1,0 +1,20 @@
+{
+  "version": "0",
+  "id": "8f3c2b1a-0000-4000-8000-000000000001",
+  "detail-type": "Incident.Assessed",
+  "source": "aegisgrid.orchestrator",
+  "account": "123456789012",
+  "time": "2026-10-17T10:00:00Z",
+  "region": "ap-south-1",
+  "resources": [],
+  "detail": {
+    "incidentId": "00000000-0000-4000-8000-000000000001",
+    "incidentType": "ROAD_ACCIDENT",
+    "severity": 4,
+    "location": { "lat": 12.9695, "lon": 79.1565 },
+    "summary": "Lorry collided with two motorbikes near VIT main gate; three injured, one unconscious with heavy bleeding.",
+    "estimatedCasualties": 3,
+    "hazards": ["fuel leak"],
+    "requiredAgents": ["AMBULANCE", "HOSPITAL", "POLICE", "TRAFFIC"]
+  }
+}

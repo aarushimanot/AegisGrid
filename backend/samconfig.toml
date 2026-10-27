@@ -1,0 +1,25 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "aegisgrid-dev"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = true
+resolve_s3 = true
+parameter_overrides = "Stage=dev"
+
+[prod.global.parameters]
+stack_name = "aegisgrid-prod"
+
+[prod.deploy.parameters]
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+confirm_changeset = true
+resolve_s3 = true
+parameter_overrides = "Stage=prod AgentBriefings=true"

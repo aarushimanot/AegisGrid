@@ -1,0 +1,8 @@
+{
+  "httpMethod": "POST",
+  "path": "/incidents",
+  "headers": { "Content-Type": "application/json" },
+  "body": "{\"description\":\"A lorry hit two bikes near VIT main gate. 3 people injured, one unconscious.\",\"location\":{\"lat\":12.9695,\"lon\":79.1565},\"media\":[{\"contentType\":\"image/jpeg\"},{\"contentType\":\"audio/mpeg\"}]}",
+  "isBase64Encoded": false,
+  "requestContext": {}
+}

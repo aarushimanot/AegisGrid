@@ -1,0 +1,163 @@
+{
+  "Comment": "AegisGrid incident analysis: multimodal AI analysis -> hybrid Bedrock/rules assessment -> Incident.Assessed event that triggers the agents",
+  "TimeoutSeconds": 900,
+  "StartAt": "PrepareAnalysis",
+  "States": {
+    "PrepareAnalysis": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${PrepareAnalysisFunctionArn}", "Payload.$": "$" },
+      "ResultSelector": { "incidentId.$": "$.Payload.incidentId", "images.$": "$.Payload.images", "audio.$": "$.Payload.audio" },
+      "Retry": [{ "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "HandleFailure" }],
+      "Next": "GatherSignals"
+    },
+    "GatherSignals": {
+      "Type": "Parallel",
+      "Comment": "Image and voice analysis run concurrently",
+      "Branches": [
+        {
+          "StartAt": "AnalyzeImages",
+          "States": {
+            "AnalyzeImages": {
+              "Type": "Map",
+              "ItemsPath": "$.images",
+              "MaxConcurrency": 5,
+              "ItemProcessor": {
+                "ProcessorConfig": { "Mode": "INLINE" },
+                "StartAt": "LabelImage",
+                "States": {
+                  "LabelImage": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": { "FunctionName": "${AnalyzeImageFunctionArn}", "Payload.$": "$" },
+                    "OutputPath": "$.Payload",
+                    "Retry": [{ "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2 }],
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "ImageFailed" }],
+                    "End": true
+                  },
+                  "ImageFailed": { "Type": "Pass", "Result": {}, "End": true }
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "TranscribeAudio",
+          "States": {
+            "TranscribeAudio": {
+              "Type": "Map",
+              "ItemsPath": "$.audio",
+              "MaxConcurrency": 3,
+              "ItemProcessor": {
+                "ProcessorConfig": { "Mode": "INLINE" },
+                "StartAt": "StartTranscription",
+                "States": {
+                  "StartTranscription": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:transcribe:startTranscriptionJob",
+                    "Parameters": {
+                      "TranscriptionJobName.$": "$.jobName",
+                      "Media": { "MediaFileUri.$": "$.mediaUri" },
+                      "MediaFormat.$": "$.mediaFormat",
+                      "IdentifyLanguage": true,
+                      "LanguageOptions": ["en-IN", "hi-IN", "ta-IN", "te-IN", "en-US"],
+                      "OutputBucketName": "${MediaBucket}",
+                      "OutputKey.$": "$.outputKey"
+                    },
+                    "ResultPath": null,
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "AudioFailed" }],
+                    "Next": "WaitForTranscript"
+                  },
+                  "WaitForTranscript": { "Type": "Wait", "Seconds": 10, "Next": "CheckTranscription" },
+                  "CheckTranscription": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:transcribe:getTranscriptionJob",
+                    "Parameters": { "TranscriptionJobName.$": "$.jobName" },
+                    "ResultSelector": { "status.$": "$.TranscriptionJob.TranscriptionJobStatus" },
+                    "ResultPath": "$.job",
+                    "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "AudioFailed" }],
+                    "Next": "TranscriptionDone"
+                  },
+                  "TranscriptionDone": {
+                    "Type": "Choice",
+                    "Choices": [
+                      { "Variable": "$.job.status", "StringEquals": "COMPLETED", "Next": "FetchTranscript" },
+                      { "Variable": "$.job.status", "StringEquals": "FAILED", "Next": "AudioFailed" }
+                    ],
+                    "Default": "WaitForTranscript"
+                  },
+                  "FetchTranscript": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": { "FunctionName": "${FetchTranscriptFunctionArn}", "Payload": { "key.$": "$.key", "outputKey.$": "$.outputKey" } },
+                    "OutputPath": "$.Payload",
+                    "Retry": [{ "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2 }],
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": "AudioFailed" }],
+                    "End": true
+                  },
+                  "AudioFailed": { "Type": "Pass", "Result": {}, "End": true }
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultSelector": { "images.$": "$[0]", "transcripts.$": "$[1]" },
+      "ResultPath": "$.signals",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.signalsError", "Next": "AnalyzeText" }],
+      "Next": "AnalyzeText"
+    },
+    "AnalyzeText": {
+      "Type": "Task",
+      "Comment": "Translate + Comprehend over description and transcripts; persists analysis",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${AnalyzeTextFunctionArn}", "Payload.$": "$" },
+      "ResultPath": null,
+      "Retry": [{ "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.textError", "Next": "AssessIncident" }],
+      "Next": "AssessIncident"
+    },
+    "AssessIncident": {
+      "Type": "Task",
+      "Comment": "Hybrid triage: Amazon Bedrock (Claude) + deterministic rules",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${AssessIncidentFunctionArn}", "Payload": { "incidentId.$": "$.incidentId" } },
+      "ResultSelector": { "publish.$": "$.Payload.publish", "detail.$": "$.Payload.detail" },
+      "ResultPath": "$.assessment",
+      "Retry": [{ "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "HandleFailure" }],
+      "Next": "ShouldPublish"
+    },
+    "ShouldPublish": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.assessment.publish", "BooleanEquals": true, "Next": "PublishAssessed" }],
+      "Default": "Done"
+    },
+    "PublishAssessed": {
+      "Type": "Task",
+      "Comment": "Fan out to the agents via EventBridge rules",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          { "EventBusName": "${EventBusName}", "Source": "aegisgrid.orchestrator", "DetailType": "Incident.Assessed", "Detail.$": "$.assessment.detail" }
+        ]
+      },
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "HandleFailure" }],
+      "Next": "Done"
+    },
+    "HandleFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${MarkFailedFunctionArn}", "Payload": { "incidentId.$": "$.incidentId", "error.$": "$.error" } },
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Next": "AnalysisFailed"
+    },
+    "AnalysisFailed": { "Type": "Fail", "Error": "IncidentAnalysisFailed", "Cause": "See HandleFailure input for details" },
+    "Done": { "Type": "Succeed" }
+  }
+}

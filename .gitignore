@@ -1,0 +1,28 @@
+# AegisGrid: one repository with backend/, frontend/ and docs/ folders.
+
+# AI Lab review documents and screenshots stay on this laptop only
+docs/
+
+# Dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+.aws-sam/
+coverage/
+
+# Secrets and local settings: never commit
+.env
+.env.*
+!.env.example
+*.local
+samconfig.local.toml
+*.pem
+*.key
+credentials
+
+# Logs and OS / editor files
+*.log
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
